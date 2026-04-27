@@ -590,16 +590,56 @@ function doLogout() {
 }
 
 /* ══ SESSIONS ══ */
-function loadSessions() {
-  try { sessions = JSON.parse(localStorage.getItem(`mf_s_${me.name}`) || '[]'); } catch(e) { sessions = []; }
+async function loadSessions() {
+  // Load from Supabase first, fallback to localStorage
+  try {
+    const data = await sb('GET', `mf_conversations?user_name=eq.${encodeURIComponent(me.name)}&order=updated_at.desc&limit=30&select=*`);
+    if (data && data.length) {
+      sessions = data.map(r => ({
+        id: r.id,
+        sbId: r.id,
+        title: r.title,
+        msgs: JSON.parse(r.messages || '[]'),
+        updatedAt: r.updated_at
+      }));
+    } else {
+      // Fallback to localStorage
+      sessions = JSON.parse(localStorage.getItem(`mf_s_${me.name}`) || '[]');
+    }
+  } catch(e) {
+    // Supabase unavailable — use localStorage
+    sessions = JSON.parse(localStorage.getItem(`mf_s_${me.name}`) || '[]');
+  }
   renderHistory();
   newChat();
 }
-function saveSessions() {
-  if (me) localStorage.setItem(`mf_s_${me.name}`, JSON.stringify(sessions.slice(0,30)));
+
+async function saveSessions() {
+  if (!me) return;
+  // Always save to localStorage as backup
+  localStorage.setItem(`mf_s_${me.name}`, JSON.stringify(sessions.slice(0,30)));
+  // Save active session to Supabase
+  if (!active) return;
+  try {
+    const payload = {
+      title: active.title,
+      user_name: me.name,
+      messages: JSON.stringify(active.msgs),
+      updated_at: new Date().toISOString()
+    };
+    if (active.sbId) {
+      // Update existing
+      await sb('PATCH', `mf_conversations?id=eq.${active.sbId}`, payload);
+    } else {
+      // Insert new
+      const result = await sb('POST', 'mf_conversations', {...payload, created_at: new Date().toISOString()});
+      if (result && result[0]) active.sbId = result[0].id;
+    }
+  } catch(e) { /* silent — localStorage backup already done */ }
 }
+
 function newChat() {
-  active = {id: Date.now(), title: 'Nova conversa', msgs: []};
+  active = {id: Date.now(), title: 'Nova conversa', msgs: [], sbId: null};
   sessions.unshift(active); saveSessions();
   renderHistory(); renderMsgs();
   document.getElementById('chat-title').textContent = 'Nova conversa';
@@ -609,13 +649,23 @@ function loadSession(id) {
   renderMsgs();
   document.getElementById('chat-title').textContent = active.title;
 }
-function deleteSession(id) {
-  sessions = sessions.filter(s => s.id !== id); saveSessions();
+async function deleteSession(id) {
+  const session = sessions.find(s => s.id === id);
+  sessions = sessions.filter(s => s.id !== id);
+  localStorage.setItem(`mf_s_${me.name}`, JSON.stringify(sessions));
+  // Delete from Supabase
+  if (session?.sbId) {
+    try { await sb('DELETE', `mf_conversations?id=eq.${session.sbId}`); } catch(e) {}
+  }
   if (active?.id === id) newChat(); else renderHistory();
 }
-function clearAll() {
+async function clearAll() {
   if (!confirm('Apagar todas as conversas?')) return;
-  sessions = []; saveSessions(); newChat();
+  // Delete all from Supabase
+  try { await sb('DELETE', `mf_conversations?user_name=eq.${encodeURIComponent(me.name)}`); } catch(e) {}
+  sessions = [];
+  localStorage.removeItem(`mf_s_${me.name}`);
+  newChat();
 }
 
 function renderHistory() {
@@ -1126,7 +1176,7 @@ async function sb(method, path, body) {
   const headers = {'apikey': SB_KEY, 'Authorization': `Bearer ${SB_KEY}`};
   if (body) headers['Content-Type'] = 'application/json';
   if (method === 'POST') headers['Prefer'] = 'return=representation';
-  if (method === 'DELETE') headers['Prefer'] = 'return=minimal';
+  if (method === 'DELETE' || method === 'PATCH') headers['Prefer'] = 'return=minimal';
   const opts = {method, headers};
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(`${SB_URL}/rest/v1/${path}`, opts);
